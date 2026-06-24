@@ -1,3 +1,6 @@
+import os
+import gc
+import glob
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -13,9 +16,12 @@ import pyvista as pv
 from model import TemplateNet, DeformNet
 from missingloss import masked_sdf_loss, deformation_loss, latent_loss
 
+gc.collect()
+torch.cuda.empty_cache()
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-
+# ── 预处理 ────────────────────────────────────────────────────────────────────
 
 def load_mesh_raw(nii_path):
     data = nib.load(nii_path).get_fdata()
@@ -27,13 +33,13 @@ def apply_norm(mesh, center, scale):
     verts = (np.array(mesh.vertices) - center) / scale
     return trimesh.Trimesh(vertices=verts, faces=np.array(mesh.faces))
 
-def sample_points(meshes, n=20000):
-    n_vol      = n // 2
-    n_per_mesh = (n - n_vol) // len(meshes)
+def sample_points(meshes, n_vol=10000, area_coef=20000, min_per_mesh=2000):
+    # 每个器官按自己的表面积 * 系数 直接决定点数，不再从固定预算里分摊
     samples = [np.random.uniform(-1, 1, (n_vol, 3))]
     for m in meshes:
+        ni    = max(int(m.area * area_coef), min_per_mesh)
         verts = np.array(m.vertices)
-        samples.append(np.random.uniform(verts.min(0), verts.max(0), (n_per_mesh, 3)))
+        samples.append(np.random.uniform(verts.min(0), verts.max(0), (ni, 3)))
     return np.vstack(samples)
 
 def compute_sdf(points, mesh):
@@ -42,37 +48,70 @@ def compute_sdf(points, mesh):
     sdf, _, _ = pcu.signed_distance_to_mesh(points, verts, faces)
     return torch.tensor(sdf, dtype=torch.float32)
 
-# ── 配置 ──────────────────────────────────────────────────────────────────────
+# ── 配置：扫描每个病人实际有哪些器官标注 ──────────────────────────────────────
 
-ROOT = r'E:\Totalsegmentator_dataset_small_v201'
+ROOT          = r'E:\Totalsegmentator_dataset_small_v201'
+SUBJECT_IDS   = ['s0011', 's0058', 's0223', 's0250', 's0310']
 
-# channel 0: lung_lower_lobe_left  channel 1: lung_lower_lobe_right  channel 2: heart
-# 缺失矩阵:  s0011=[1,1,0]  s0058=[1,0,1]  s0223=[0,1,1]
-SUBJECTS = [
-    {'paths': [f'{ROOT}\\s0011\\segmentations\\lung_lower_lobe_left.nii.gz',
-               f'{ROOT}\\s0011\\segmentations\\lung_lower_lobe_right.nii.gz'],
-     'organs': [0, 1]},
-    {'paths': [f'{ROOT}\\s0058\\segmentations\\lung_lower_lobe_left.nii.gz',
-               f'{ROOT}\\s0058\\segmentations\\heart.nii.gz'],
-     'organs': [0, 2]},
-    {'paths': [f'{ROOT}\\s0223\\segmentations\\lung_lower_lobe_right.nii.gz',
-               f'{ROOT}\\s0223\\segmentations\\heart.nii.gz'],
-     'organs': [1, 2]},
-]
+subject_organ_files = []
+for sid in SUBJECT_IDS:
+    seg_dir = os.path.join(ROOT, sid, 'segmentations')
+    files   = glob.glob(os.path.join(seg_dir, '*.nii.gz'))
+    organ_map = {}
+    for f in files:
+        name = os.path.basename(f)[:-len('.nii.gz')]
+        data = nib.load(f).get_fdata()
+        if (data > 0.5).sum() > 0:          # 文件存在但 mask 全空 = 视为缺失
+            organ_map[name] = f
+    subject_organ_files.append(organ_map)
 
-C          = 3       # 总 channel 数（所有器官）
+# channel 顺序 = 所有病人出现过的器官名的并集（按字母排序，保证可复现），先只训前 20 个
+organ_names = sorted(set().union(*[m.keys() for m in subject_organ_files]))[:20]
+C = len(organ_names)
+
+SUBJECTS = []
+for sid, organ_map in zip(SUBJECT_IDS, subject_organ_files):
+    paths  = [organ_map[name] for name in organ_names if name in organ_map]
+    organs = [c for c, name in enumerate(organ_names) if name in organ_map]
+    SUBJECTS.append({'paths': paths, 'organs': organs})
+    missing = [name for name in organ_names if name not in organ_map]
+    print(f"{sid}: 有 {len(organs)}/{C} 个器官, 缺失 {missing}")
 LATENT_DIM = 256
-N_EPOCHS   = 5000
-BATCH_SIZE = 2048
+N_EPOCHS   = 30000
+BATCH_SIZE = 4096
 LR_MODEL   = 1e-4
-LR_LATENT  = 1e-3
+LR_LATENT  = 1e-4
 
-# ── 全局归一化：收集所有 subject 所有可用器官的顶点 ──────────────────────────
+# ── 刚性预对齐：用所有 subject 共有的器官算质心，平移对齐，再统一缩放 ──────────
 
-all_raw_flat = [load_mesh_raw(p) for subj in SUBJECTS for p in subj['paths']]
-all_verts    = np.vstack([np.array(m.vertices) for m in all_raw_flat])
-global_center = all_verts.mean(axis=0)
-global_scale  = np.abs(all_verts - global_center).max()
+common_organs = set(organ_names)
+for organ_map in subject_organ_files:
+    common_organs &= set(organ_map.keys())
+common_organs = [name for name in organ_names if name in common_organs]
+print(f"用于对齐的共有器官: {common_organs}")
+
+raw_meshes_list = [[load_mesh_raw(p) for p in subj['paths']] for subj in SUBJECTS]
+
+if common_organs:
+    subject_centers = []
+    for subj, raw_meshes in zip(SUBJECTS, raw_meshes_list):
+        ref_verts = np.vstack([
+            np.array(raw_meshes[local_idx].vertices)
+            for local_idx, global_ch in enumerate(subj['organs'])
+            if organ_names[global_ch] in common_organs
+        ])
+        subject_centers.append(ref_verts.mean(axis=0))
+else:
+    print("没有所有 subject 共有的器官，退化为全局统一中心")
+    all_verts = np.vstack([np.array(m.vertices) for raw in raw_meshes_list for m in raw])
+    subject_centers = [all_verts.mean(axis=0)] * len(SUBJECTS)
+
+all_centered_verts = np.vstack([
+    np.array(m.vertices) - subject_centers[i]
+    for i, raw_meshes in enumerate(raw_meshes_list)
+    for m in raw_meshes
+])
+global_scale = np.abs(all_centered_verts).max()
 
 # ── 数据加载 ──────────────────────────────────────────────────────────────────
 
@@ -81,9 +120,8 @@ sdf_list        = []
 mask_list       = []
 gt_meshes_list  = []   # 每个 subject: {global_ch: normalized trimesh}
 
-for subj in SUBJECTS:
-    raw_meshes = [load_mesh_raw(p) for p in subj['paths']]
-    meshes     = [apply_norm(m, global_center, global_scale) for m in raw_meshes]
+for subj, raw_meshes, center in zip(SUBJECTS, raw_meshes_list, subject_centers):
+    meshes     = [apply_norm(m, center, global_scale) for m in raw_meshes]
     pts        = sample_points(meshes)
     N          = len(pts)
 
@@ -139,13 +177,17 @@ for epoch in range(N_EPOCHS):
     x_prime  = x + delta_x
     pred_sdf = template_net(x_prime)
 
-    l_sdf = masked_sdf_loss(pred_sdf, gt, mask)
-    l_def = deformation_loss(delta_x, x)
-    l_lat = latent_loss(z)
-    loss  = l_sdf + 1e-3 * l_def + 1e-4 * l_lat
+    l_sdf  = masked_sdf_loss(pred_sdf, gt, mask)
+    l_def  = deformation_loss(delta_x, x)
+    l_lat  = latent_loss(z)
+    loss   = l_sdf + 1e-3 * l_def + 1e-4 * l_lat
 
     optimizer.zero_grad()
     loss.backward()
+    torch.nn.utils.clip_grad_norm_(
+        list(template_net.parameters()) + list(deform_net.parameters()), max_norm=1.0
+    )
+    torch.nn.utils.clip_grad_norm_(latent_codes.parameters(), max_norm=0.1)
     optimizer.step()
 
     loss_history.append(l_sdf.item())
@@ -161,7 +203,7 @@ plt.xlabel('Epoch')
 plt.ylabel('SDF Loss')
 plt.title('Training Loss (missing organs)')
 plt.savefig('loss_curve_missing.png')
-plt.show()
+plt.close()
 
 resolution = 128
 grid_1d = torch.linspace(-1.2, 1.2, resolution)
@@ -174,17 +216,22 @@ with torch.no_grad():
         sdf_vals.append(template_net(grid[i:i+4096]).cpu())
     sdf_vol = torch.cat(sdf_vals).reshape(resolution, resolution, resolution, C).numpy()
 
-organ_names   = ['lung_lower_lobe_left', 'lung_lower_lobe_right', 'heart']
-organ_colors  = ['steelblue', 'tomato', 'mediumseagreen']
+cmap = plt.colormaps['tab20']
+organ_colors = [cmap(i % 20) for i in range(C)]
 
 for c, name in enumerate(organ_names):
     print(f"{name} sdf_vol: min={sdf_vol[...,c].min():.4f}, max={sdf_vol[...,c].max():.4f}")
+
+def safe_level(vol):
+    if vol.min() <= 0.0 <= vol.max():
+        return 0.0
+    return float(vol.min()) + 1e-5   # 全正/全负时退化为提取最内层等值面
 
 plotter = pv.Plotter(off_screen=True)
 for c, (name, color) in enumerate(zip(organ_names, organ_colors)):
     vol = sdf_vol[..., c]
     try:
-        verts, faces, _, _ = marching_cubes(vol, level=0.0)
+        verts, faces, _, _ = marching_cubes(vol, level=safe_level(vol))
         faces_pv = np.column_stack([np.full(len(faces), 3), faces]).flatten()
         mesh = pv.PolyData(verts.astype(np.float32), faces_pv)
         plotter.add_mesh(mesh, color=color, opacity=0.5, label=name)
@@ -203,37 +250,44 @@ def verts_to_coords(verts, resolution, vmin, vmax):
 vmin, vmax = grid_1d[0].item(), grid_1d[-1].item()
 
 for i, subj in enumerate(SUBJECTS):
-    z_i = latent_codes.weight[i].detach()
+    try:
+        z_i = latent_codes.weight[i].detach()
 
-    with torch.no_grad():
-        pred_vals = []
-        for j in range(0, len(grid), 4096):
-            gj = grid[j:j+4096]
-            zj = z_i.unsqueeze(0).expand(len(gj), -1)
-            dx = deform_net(torch.cat([gj, zj], dim=-1))
-            pred_vals.append(template_net(gj + dx).cpu())
-        pred_vol = torch.cat(pred_vals).reshape(resolution, resolution, resolution, C).numpy()
+        with torch.no_grad():
+            pred_vals = []
+            for j in range(0, len(grid), 4096):
+                gj = grid[j:j+4096]
+                zj = z_i.unsqueeze(0).expand(len(gj), -1)
+                dx = deform_net(torch.cat([gj, zj], dim=-1))
+                pred_vals.append(template_net(gj + dx).cpu())
+            pred_vol = torch.cat(pred_vals).reshape(resolution, resolution, resolution, C).numpy()
 
-    plotter = pv.Plotter(off_screen=True)
+        plotter = pv.Plotter(off_screen=True)
 
-    for c, (name, color) in enumerate(zip(organ_names, organ_colors)):
-        try:
-            verts, faces, _, _ = marching_cubes(pred_vol[..., c], level=0.0)
-            verts = verts_to_coords(verts, resolution, vmin, vmax)
-            faces_pv = np.column_stack([np.full(len(faces), 3), faces]).flatten()
-            mesh = pv.PolyData(verts.astype(np.float32), faces_pv)
-            plotter.add_mesh(mesh, color=color, opacity=0.4, label=f'{name} (pred)')
-        except Exception as e:
-            print(f"subject {i} {name} pred marching cubes failed: {e}")
+        for c, (name, color) in enumerate(zip(organ_names, organ_colors)):
+            try:
+                vol_c = pred_vol[..., c]
+                verts, faces, _, _ = marching_cubes(vol_c, level=safe_level(vol_c))
+                verts = verts_to_coords(verts, resolution, vmin, vmax)
+                faces_pv = np.column_stack([np.full(len(faces), 3), faces]).flatten()
+                mesh = pv.PolyData(verts.astype(np.float32), faces_pv)
+                plotter.add_mesh(mesh, color=color, opacity=0.4, label=f'{name} (pred)')
+            except Exception as e:
+                print(f"subject {i} {name} pred marching cubes failed: {e}")
 
-    for global_ch, gt_mesh in gt_meshes_list[i].items():
-        gt_verts = np.array(gt_mesh.vertices).astype(np.float32)
-        gt_faces = np.array(gt_mesh.faces)
-        faces_pv = np.column_stack([np.full(len(gt_faces), 3), gt_faces]).flatten()
-        gt_pv = pv.PolyData(gt_verts, faces_pv)
-        plotter.add_mesh(gt_pv, color='black', style='wireframe',
-                         label=f'{organ_names[global_ch]} (GT)')
+        for global_ch, gt_mesh in gt_meshes_list[i].items():
+            gt_verts = np.array(gt_mesh.vertices).astype(np.float32)
+            gt_faces = np.array(gt_mesh.faces)
+            faces_pv = np.column_stack([np.full(len(gt_faces), 3), gt_faces]).flatten()
+            gt_pv = pv.PolyData(gt_verts, faces_pv)
+            plotter.add_mesh(gt_pv, color='black', style='wireframe',
+                             label=f'{organ_names[global_ch]} (GT)')
 
-    plotter.add_legend()
-    plotter.export_html(f'subject_{i}_recon_vs_gt.html')
-    plotter.close()
+        plotter.add_legend()
+        plotter.export_html(f'subject_{i}_recon_vs_gt.html')
+        plotter.close()
+    except Exception as e:
+        print(f"subject {i} 整体处理失败，跳过: {e}")
+    finally:
+        gc.collect()
+        torch.cuda.empty_cache()
