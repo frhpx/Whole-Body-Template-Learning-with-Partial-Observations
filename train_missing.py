@@ -15,7 +15,7 @@ from missingloss import masked_sdf_loss, deformation_loss, latent_loss
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# ── 预处理 ────────────────────────────────────────────────────────────────────
+
 
 def load_mesh_raw(nii_path):
     data = nib.load(nii_path).get_fdata()
